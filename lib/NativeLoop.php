@@ -2,6 +2,7 @@
 
 namespace Amp\Loop;
 
+use Amp\Loop\Internal\Timer;
 use Amp\Loop\Internal\Watcher;
 use Interop\Async\Loop\UnsupportedFeatureException;
 
@@ -32,9 +33,14 @@ class NativeLoop extends Loop {
     private $timerExpires = [];
 
     /**
-     * @var \SplPriorityQueue
+     * @var \Amp\Loop\Internal\Timer[]
      */
-    private $timerQueue;
+    private $timerHeap = [];
+
+    /**
+     * @var int
+     */
+    private $timerCount = 0;
 
     /**
      * @var \Amp\Loop\Internal\Watcher[][]
@@ -47,35 +53,75 @@ class NativeLoop extends Loop {
     private $signalHandling;
 
     public function __construct() {
-        $this->timerQueue = new \SplPriorityQueue();
         $this->signalHandling = \extension_loaded("pcntl");
     }
 
+    /**
+     * {@inheritdoc}
+     */
     protected function dispatch($blocking) {
-        $this->selectStreams(
-            $this->readStreams,
-            $this->writeStreams,
-            $blocking ? $this->getTimeout() : 0
-        );
+        $timeout = 0;
+
+        if ($blocking) {
+            if (!empty($this->timerHeap)) {
+                $timeout = $this->timerHeap[0]->expiration - (int) (\microtime(true) * self::MILLISEC_PER_SEC);
+                if ($timeout < 0) {
+                    $timeout = 0;
+                }
+            } else {
+                $timeout = -1;
+            }
+        }
+
+        $this->selectStreams($this->readStreams, $this->writeStreams, $timeout);
 
         if (!empty($this->timerExpires)) {
             $time = (int) (\microtime(true) * self::MILLISEC_PER_SEC);
 
-            while (!$this->timerQueue->isEmpty()) {
-                list($watcher, $expiration) = $this->timerQueue->top();
+            while (!empty($this->timerHeap)) {
+                $timer = $this->timerHeap[0];
 
+                $watcher = $timer->watcher;
                 $id = $watcher->id;
 
-                if (!isset($this->timerExpires[$id]) || $expiration !== $this->timerExpires[$id]) {
-                    $this->timerQueue->extract(); // Timer was removed from queue.
-                    continue;
+                if (isset($this->timerExpires[$id]) && $this->timerExpires[$id] > $time) {
+                    break; // Timer at top of heap has not expired.
                 }
 
-                if ($this->timerExpires[$id] > $time) { // Timer at top of queue has not expired.
-                    return;
+                // Extract timer from heap.
+                $this->timerHeap[0] = $this->timerHeap[--$this->timerCount];
+                unset($this->timerHeap[$this->timerCount]);
+
+                $node = 0;
+                while (($child = ($node << 1) + 1) < $this->timerCount) {
+                    if (($this->timerHeap[$child]->expiration < $this->timerHeap[$node]->expiration)
+                        && ($child + 1 >= $this->timerCount
+                            || $this->timerHeap[$child]->expiration < $this->timerHeap[$child + 1]->expiration
+                        )
+                    ) {
+                        // Left child is greater than parent and greater than right child.
+                        $temp = $this->timerHeap[$node];
+                        $this->timerHeap[$node] = $this->timerHeap[$child];
+                        $this->timerHeap[$child] = $temp;
+
+                        $node = $child;
+                    } elseif ($child + 1 < $this->timerCount
+                        && $this->timerHeap[$child + 1]->expiration < $this->timerHeap[$node]->expiration
+                    ) {
+                        // Right child is greater than parent and greater than left child.
+                        $temp = $this->timerHeap[$node];
+                        $this->timerHeap[$node] = $this->timerHeap[$child + 1];
+                        $this->timerHeap[$child + 1] = $temp;
+
+                        $node = $child + 1;
+                    } else {  // Left and right child are less than parent.
+                        break;
+                    }
                 }
 
-                $this->timerQueue->extract();
+                if (!isset($this->timerExpires[$id]) || $this->timerExpires[$id] !== $timer->expiration) {
+                    continue; // Timer was removed from queue.
+                }
 
                 if ($watcher->type & Watcher::REPEAT) {
                     $this->activate([$watcher]);
@@ -155,32 +201,6 @@ class NativeLoop extends Loop {
     }
 
     /**
-     * @return int Milliseconds until next timer expires or -1 if there are no pending times.
-     */
-    private function getTimeout() {
-        while (!$this->timerQueue->isEmpty()) {
-            list($watcher, $expiration) = $this->timerQueue->top();
-
-            $id = $watcher->id;
-
-            if (!isset($this->timerExpires[$id]) || $expiration !== $this->timerExpires[$id]) {
-                $this->timerQueue->extract(); // Timer was removed from queue.
-                continue;
-            }
-
-            $expiration -= (int) (\microtime(true) * self::MILLISEC_PER_SEC);
-
-            if ($expiration < 0) {
-                return 0;
-            }
-
-            return $expiration;
-        }
-
-        return -1;
-    }
-
-    /**
      * {@inheritdoc}
      *
      * @throws \Interop\Async\Loop\UnsupportedFeatureException If the pcntl extension is not available.
@@ -214,10 +234,21 @@ class NativeLoop extends Loop {
 
                 case Watcher::DELAY:
                 case Watcher::REPEAT:
-                    $priority = (\microtime(true) * self::MILLISEC_PER_SEC) + $watcher->value;
-                    $expiration = (int) $priority;
+                    $expiration = (int) (\microtime(true) * self::MILLISEC_PER_SEC) + $watcher->value;
                     $this->timerExpires[$watcher->id] = $expiration;
-                    $this->timerQueue->insert([$watcher, $expiration], -$priority);
+
+                    $timer = new Timer;
+                    $timer->watcher = $watcher;
+                    $timer->expiration = $expiration;
+
+                    $node = $this->timerCount;
+                    $this->timerHeap[$this->timerCount++] = $timer;
+
+                    while (0 !== $node && $timer->expiration < $this->timerHeap[$parent = ($node - 1) >> 1]->expiration) {
+                        $this->timerHeap[$node] = $this->timerHeap[$parent];
+                        $this->timerHeap[$parent] = $timer;
+                        $node = $parent;
+                    }
                     break;
 
                 case Watcher::SIGNAL:
@@ -231,8 +262,7 @@ class NativeLoop extends Loop {
                                 $callback = $watcher->callback;
                                 $callback($watcher->id, $signo, $watcher->data);
                             }
-                        })
-                        ) {
+                        })) {
                             throw new \RuntimeException("Failed to register signal handler");
                         }
                     }
